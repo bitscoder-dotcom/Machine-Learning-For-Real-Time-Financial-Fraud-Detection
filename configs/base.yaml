@@ -1,9 +1,10 @@
 dataset_path: "data/raw/creditcard.csv"
 target_col: "Class"
-test_size: 0.2
 random_state: 42
 
 model:
   type: "logreg"
   max_iter: 2000
   class_weight: "balanced"
+
+split_path: results/splits/creditcard_seed42_70_15_15.npz
