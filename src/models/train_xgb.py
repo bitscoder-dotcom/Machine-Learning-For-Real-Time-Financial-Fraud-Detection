@@ -4,9 +4,7 @@ import joblib
 import pandas as pd
 import numpy as np
 from datetime import datetime
-from pathlib import Path
 
-from sklearn.model_selection import train_test_split
 from sklearn.metrics import average_precision_score, precision_recall_curve
 from xgboost import XGBClassifier
 from src.utils.run_logger import append_run_csv
