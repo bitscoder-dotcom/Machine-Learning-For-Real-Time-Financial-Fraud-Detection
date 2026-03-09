@@ -47,40 +47,16 @@ def make_time_aware_70_15_15_indices(t: np.ndarray) -> Tuple[np.ndarray, np.ndar
     Time-aware split: earlier -> later.
     Avoids splitting identical timestamps across boundaries (best-effort).
     """
-    if t is None:
-        raise ValueError("Time-aware split requires 't' (time/order array).")
-
     t = np.asarray(t)
     if t.ndim != 1:
-        raise ValueError("t must be a 1D array.")
-    if np.any(pd_isna(t)):
-        raise ValueError("t contains missing values; fill/clean before time split.")
-
-    n = len(t)
-    idx_sorted = np.argsort(t, kind="mergesort")  # stable
-
-    # nominal cut positions
-    train_end = int(n * 0.70)
-    val_end = int(n * 0.85)
-
-    # pick cut timestamps and split by time thresholds so we don't split equal timestamps
-    t1 = t[idx_sorted[train_end - 1]] if train_end > 0 else t[idx_sorted[0]]
-    t2 = t[idx_sorted[val_end - 1]] if val_end > 0 else t[idx_sorted[-1]]
-
-    train_mask = t <= t1
-    val_mask = (t > t1) & (t <= t2)
-    test_mask = t > t2
-
-    idx_train = np.where(train_mask)[0]
-    idx_val = np.where(val_mask)[0]
-    idx_test = np.where(test_mask)[0]
-
-    # fallback if thresholds caused empty split (rare but possible with heavy ties)
-    if len(idx_val) == 0 or len(idx_test) == 0:
-        idx_train = idx_sorted[:train_end]
-        idx_val = idx_sorted[train_end:val_end]
-        idx_test = idx_sorted[val_end:]
-
+        raise ValueError("t must be 1D.")
+    idx_sorted = np.argsort(t, kind="mergesort")
+    n = len(idx_sorted)
+    n_train = int(n * 0.70)
+    n_val = int(n * 0.15)
+    idx_train = idx_sorted[:n_train]
+    idx_val = idx_sorted[n_train:n_train + n_val]
+    idx_test = idx_sorted[n_train + n_val:]
     return np.sort(idx_train), np.sort(idx_val), np.sort(idx_test)
 
 
@@ -100,7 +76,7 @@ def assert_no_id_overlap(ids: Sequence, train_idx: np.ndarray, val_idx: np.ndarr
     ids can be TransactionID or a composite like (card1, card2, addr1).
     If you pass a tuple/list per row, convert it before calling.
     """
-    ids = np.asarray(ids)
+    ids = np.asarray(ids).astype(str)
 
     tr = set(ids[train_idx].tolist())
     va = set(ids[val_idx].tolist())
@@ -126,8 +102,15 @@ def assert_time_order(t: Sequence, train_idx: np.ndarray, val_idx: np.ndarray, t
         raise ValueError(f"Time leakage: val max ({va_max}) > test min ({te_min})")
 
 
-def get_or_create_split(*, y: np.ndarray, seed: int, split_path: Path,
-    dataset_path: Optional[Path] = None, method: SplitMethod = "stratified", t: Optional[np.ndarray] = None,
+def get_or_create_split(
+    *,
+    y: np.ndarray,
+    seed: int,
+    split_path: Path,
+    dataset_path: Optional[Path] = None,
+    method: SplitMethod = "stratified",
+    t: Optional[np.ndarray] = None,
+    ids_for_overlap_check: Optional[Sequence] = None,
     run_checks: bool = True,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     split_path.parent.mkdir(parents=True, exist_ok=True)
@@ -141,8 +124,8 @@ def get_or_create_split(*, y: np.ndarray, seed: int, split_path: Path,
         val_idx = data["val_idx"]
         test_idx = data["test_idx"]
 
-        meta_n = int(data["n"]) if "n" in data else expected_n
-        meta_hash = str(data["dataset_sha256"]) if "dataset_sha256" in data else ""
+        meta_n = int(data["n"])
+        meta_hash = str(data["dataset_sha256"])
         meta_method = str(data["method"]) if "method" in data else "stratified"
 
         if meta_n != expected_n:
@@ -150,16 +133,24 @@ def get_or_create_split(*, y: np.ndarray, seed: int, split_path: Path,
         if dataset_hash and meta_hash and meta_hash != dataset_hash:
             raise ValueError("Dataset hash changed since split was created. (CSV changed or replaced.)")
         if meta_method != method:
-            raise ValueError(
-                f"Split file method is '{meta_method}', but you requested '{method}'. Use a new split_path.")
+            raise ValueError(f"Split file method is '{meta_method}', but you requested '{method}'. Use a new split_path.")
 
         return train_idx, val_idx, test_idx
+
     if method == "stratified":
         train_idx, val_idx, test_idx = make_stratified_70_15_15_indices(y, seed)
     elif method == "time":
+        if t is None:
+            raise ValueError("method='time' requires t=... (time/order array)")
         train_idx, val_idx, test_idx = make_time_aware_70_15_15_indices(t)
     else:
         raise ValueError(f"Unknown method: {method}")
+
+    if run_checks:
+        if ids_for_overlap_check is not None:
+            assert_no_id_overlap(ids_for_overlap_check, train_idx, val_idx, test_idx)
+        if method == "time" and t is not None:
+            assert_time_order(t, train_idx, val_idx, test_idx)
 
     np.savez(
         split_path,

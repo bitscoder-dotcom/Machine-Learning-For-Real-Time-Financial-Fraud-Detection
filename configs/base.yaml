@@ -2,9 +2,17 @@ dataset_path: "data/raw/creditcard.csv"
 target_col: "Class"
 random_state: 42
 
+# Phase 2: splitting
+time_col: "Time"
+train_on_split: "time"  # baseline | time
+split_baseline_path: "results/splits/creditcard_seed42_70_15_15.npz"
+split_time_path: "results/splits/creditcard_time_Time_70_15_15.npz"
+
+# Phase 3: evaluation controls
+k: 1000
+target_fpr: 0.01
+
 model:
   type: "logreg"
   max_iter: 2000
   class_weight: "balanced"
-
-split_path: results/splits/creditcard_seed42_70_15_15.npz

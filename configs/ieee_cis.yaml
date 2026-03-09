@@ -1,0 +1,22 @@
+dataset_path: "data/raw/train_transaction.csv"
+target_col: "isFraud"
+random_state: 42
+
+# Phase 2: splitting
+time_col: "TransactionDT"
+train_on_split: "time"   # baseline | time
+split_baseline_path: "results/splits/ieee_seed42_70_15_15.npz"
+split_time_path: "results/splits/ieee_time_TransactionDT_70_15_15.npz"
+
+# Leakage / IDs
+drop_cols: ["TransactionID"]
+id_col: "TransactionID"
+
+# Phase 3: evaluation controls
+k: 1000
+target_fpr: 0.01
+
+model:
+  type: "logreg"
+  max_iter: 2000
+  class_weight: "balanced"

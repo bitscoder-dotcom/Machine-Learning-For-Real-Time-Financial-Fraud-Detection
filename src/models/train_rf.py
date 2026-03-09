@@ -1,31 +1,31 @@
-import os
-import yaml
-import joblib
+# src/models/train_rf.py
+import os, yaml, joblib
 import pandas as pd
 import numpy as np
-import argparse
 from datetime import datetime
 
-from xgboost import XGBClassifier
+from sklearn.ensemble import RandomForestClassifier
 from src.utils.run_logger import append_run_csv
 from src.utils.split_manager import project_root, get_or_create_split
-from src.utils.eval_metrics import (pr_auc, recall_at_fpr, precision_at_k, fraud_found_at_k,
-    pick_threshold_by_fpr, metrics_at_threshold, measure_latency_ms_per_row)
+from src.utils.eval_metrics import (
+    pr_auc, recall_at_fpr, precision_at_k, fraud_found_at_k,
+    pick_threshold_by_fpr, metrics_at_threshold, measure_latency_ms_per_row
+)
 
 ROOT = project_root()
 SEED = 42
-
 
 def compute_split_metrics(y_true, y_score, k=1000, target_fpr=0.01) -> dict:
     return {
         "pr_auc": pr_auc(y_true, y_score),
         "recall_at_fpr": recall_at_fpr(y_true, y_score, target_fpr=target_fpr),
-        f"precision_at_{k}": precision_at_k(y_true, y_score, k=k),
-        f"fraud_found_at_{k}": fraud_found_at_k(y_true, y_score, k=k),
+        "precision_at_k": precision_at_k(y_true, y_score, k=k),
+        "fraud_found_at_k": fraud_found_at_k(y_true, y_score, k=k),
     }
 
-
 def main():
+    # accept same --config pattern you already added in other scripts
+    import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="configs/base.yaml")
     args = parser.parse_args()
@@ -36,14 +36,12 @@ def main():
     dataset_path = (ROOT / cfg["dataset_path"]).resolve()
     seed = int(cfg.get("random_state", SEED))
 
-    # paths (keeps your existing cfg["split_path"] working as baseline)
-    baseline_split_path = (
-                ROOT / cfg.get("split_baseline_path", cfg.get("split_path", "results/splits/split.npz"))).resolve()
+    baseline_split_path = (ROOT / cfg.get("split_baseline_path", cfg.get("split_path", "results/splits/split.npz"))).resolve()
     time_split_path = (ROOT / cfg.get("split_time_path", "results/splits/split_time.npz")).resolve()
 
-    train_on = cfg.get("train_on_split", "baseline")  # "baseline" or "time"
-    time_col = cfg.get("time_col")  # e.g. "Time" or "TransactionDT"
-    id_col = cfg.get("id_col")  # optional
+    train_on = cfg.get("train_on_split", "baseline")
+    time_col = cfg.get("time_col")
+    id_col = cfg.get("id_col")
 
     df = pd.read_csv(dataset_path)
     y = df[cfg["target_col"]].astype(int).values
@@ -52,31 +50,20 @@ def main():
     X = df.drop(columns=drop_cols, errors="ignore").select_dtypes(include=[np.number]).fillna(0)
 
     ids = df[id_col].astype(str).values if (id_col and id_col in df.columns) else None
-    k = int(cfg.get("k", 1000))
-    target_fpr = float(cfg.get("target_fpr", 0.01))
 
-    # 1) baseline split
+    # splits
     tr_b, va_b, te_b = get_or_create_split(
-        y=y, seed=seed,
-        split_path=baseline_split_path,
-        dataset_path=dataset_path,
-        method="stratified",
-        ids_for_overlap_check=ids,
+        y=y, seed=seed, split_path=baseline_split_path, dataset_path=dataset_path,
+        method="stratified", ids_for_overlap_check=ids
     )
 
-    # 2) time-aware split (only if time_col exists)
     tr_t = va_t = te_t = None
     if time_col and time_col in df.columns:
         tr_t, va_t, te_t = get_or_create_split(
-            y=y, seed=seed,
-            split_path=time_split_path,
-            dataset_path=dataset_path,
-            method="time",
-            t=df[time_col].values,
-            ids_for_overlap_check=ids,
+            y=y, seed=seed, split_path=time_split_path, dataset_path=dataset_path,
+            method="time", t=df[time_col].values, ids_for_overlap_check=ids
         )
 
-    # choose which split to train on
     if train_on == "time" and tr_t is not None:
         train_idx, val_idx, test_idx = tr_t, va_t, te_t
         split_used = f"time({time_col})"
@@ -90,24 +77,17 @@ def main():
     X_val, y_val = X.iloc[val_idx], y[val_idx]
     X_test, y_test = X.iloc[test_idx], y[test_idx]
 
+    k = int(cfg.get("k", 1000))
+    target_fpr = float(cfg.get("target_fpr", 0.01))
 
-    # imbalance ratio for scale_pos_weight
-    n_pos = int(np.sum(y_train == 1))
-    n_neg = int(np.sum(y_train == 0))
-    scale_pos_weight = (n_neg / max(n_pos, 1))
-
-    model = XGBClassifier(
-        n_estimators=500,
-        max_depth=4,
-        learning_rate=0.05,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        reg_lambda=1.0,
-        tree_method="hist",
-        eval_metric="aucpr",
-        n_jobs=-1,
+    rf_cfg = cfg.get("rf", {})
+    model = RandomForestClassifier(
+        n_estimators=int(rf_cfg.get("n_estimators", 300)),
+        max_depth=rf_cfg.get("max_depth", None),
+        min_samples_leaf=int(rf_cfg.get("min_samples_leaf", 1)),
+        n_jobs=int(rf_cfg.get("n_jobs", -1)),
         random_state=seed,
-        scale_pos_weight=scale_pos_weight
+        class_weight=rf_cfg.get("class_weight", "balanced_subsample"),
     )
 
     model.fit(X_train, y_train)
@@ -116,17 +96,9 @@ def main():
     val_score = model.predict_proba(X_val)[:, 1]
     test_score = model.predict_proba(X_test)[:, 1]
 
-    op = pick_threshold_by_fpr(y_val, val_score, target_fpr=target_fpr)
-    val_op = metrics_at_threshold(y_val, val_score, op.threshold)
-    test_op = metrics_at_threshold(y_test, test_score, op.threshold)
-
-    print("MODEL TYPE:", type(model))
-    print("BOOSTED ROUNDS:", model.get_booster().num_boosted_rounds())
-    print("VAL SCORE HEAD:", val_score[:10])
-
     metrics = {
         "timestamp": datetime.now().isoformat(timespec="seconds"),
-        "model": "xgb_baseline",
+        "model": "rf_baseline",
         "split": "70/15/15 (train/val/test)",
         "seed": seed,
         "n_train": int(len(y_train)),
@@ -138,58 +110,47 @@ def main():
         "fraud_count_train": int(np.sum(y_train)),
         "fraud_count_val": int(np.sum(y_val)),
         "fraud_count_test": int(np.sum(y_test)),
-        "scale_pos_weight": float(scale_pos_weight),
+        "split_used": split_used,
+        "split_file": split_file,
+        "k": k,
+        "target_fpr": target_fpr,
     }
 
-    metrics["split_used"] = split_used
-    metrics["split_file"] = split_file
+    # split-level metrics
+    metrics.update({f"train_{k}": v for k, v in compute_split_metrics(y_train, train_score, k=k, target_fpr=target_fpr).items()})
+    metrics.update({f"val_{k}": v for k, v in compute_split_metrics(y_val, val_score, k=k, target_fpr=target_fpr).items()})
+    metrics.update({f"test_{k}": v for k, v in compute_split_metrics(y_test, test_score, k=k, target_fpr=target_fpr).items()})
 
-    metrics["k"] = k
-    metrics["target_fpr"] = target_fpr
-
+    # operating point on val, applied to test
+    op = pick_threshold_by_fpr(y_val, val_score, target_fpr=target_fpr)
     metrics["op_threshold"] = op.threshold
     metrics["op_val_fpr"] = op.achieved_fpr
     metrics["op_val_recall"] = op.achieved_recall
+    metrics.update({f"val_{k}": v for k, v in metrics_at_threshold(y_val, val_score, op.threshold).items()})
+    metrics.update({f"test_{k}": v for k, v in metrics_at_threshold(y_test, test_score, op.threshold).items()})
 
-    metrics.update({f"val_op_{key}": val for key, val in val_op.items()})
-    metrics.update({f"test_op_{key}": val for key, val in test_op.items()})
-
+    # latency
     lat = measure_latency_ms_per_row(model, X_test, warmup=1, repeats=3)
     metrics["test_ms_per_row"] = lat["ms_per_row"]
     metrics["test_rows_per_s"] = lat["rows_per_s"]
 
-    train_m = compute_split_metrics(y_train, train_score, k=k, target_fpr=target_fpr)
-    val_m = compute_split_metrics(y_val, val_score, k=k, target_fpr=target_fpr)
-    test_m = compute_split_metrics(y_test, test_score, k=k, target_fpr=target_fpr)
-
-    metrics.update({f"train_{key}": value for key, value in train_m.items()})
-    metrics.update({f"val_{key}": value for key, value in val_m.items()})
-    metrics.update({f"test_{key}": value for key, value in test_m.items()})
-
     os.makedirs("results/metrics", exist_ok=True)
     os.makedirs("results/models", exist_ok=True)
-
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-    metrics_path = f"results/metrics/xgb_{run_id}.yaml"
-    model_path = f"results/models/xgb_{run_id}.joblib"
-
+    metrics_path = f"results/metrics/rf_{run_id}.yaml"
+    model_path = f"results/models/rf_{run_id}.joblib"
     metrics["model_path"] = model_path
     metrics["metrics_path"] = metrics_path
 
     with open(metrics_path, "w") as f:
         yaml.safe_dump(metrics, f, sort_keys=False)
 
-    print("Saving model type:", type(model))
-    assert "XGBClassifier" in str(type(model)), "Not saving an XGBClassifier model!"
-
     joblib.dump(model, model_path)
     append_run_csv(metrics)
 
     print(f"Saved metrics -> {metrics_path}")
     print(f"Saved model   -> {model_path}")
-    print("Appended run  -> results/metrics/runs.csv")
     print(metrics)
-
 
 if __name__ == "__main__":
     main()

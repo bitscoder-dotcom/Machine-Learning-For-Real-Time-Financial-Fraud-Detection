@@ -1,171 +1,173 @@
 import argparse
-import time
+from datetime import datetime
 from pathlib import Path
-
-import joblib
-import numpy as np
-import pandas as pd
 import yaml
-from scipy.stats import spearmanr
-from sklearn.metrics import average_precision_score, precision_recall_curve
+import pandas as pd
 
-from src.utils.split_manager import project_root, get_or_create_split
-
-
-SEED = 42
+from src.utils.split_manager import project_root
 
 
-def recall_at_fixed_precision(y_true, y_score, min_precision=0.10) -> float:
-    precision, recall, _ = precision_recall_curve(y_true, y_score)
-    valid = precision >= min_precision
-    return float(np.max(recall[valid])) if np.any(valid) else 0.0
+def parse_ts(x):
+    if not x:
+        return None
+    try:
+        return datetime.fromisoformat(str(x))
+    except Exception:
+        return None
 
 
-def precision_at_k(y_true, y_score, k=1000) -> float:
-    k = min(k, len(y_true))
-    topk_idx = np.argsort(y_score)[-k:]
-    return float(np.mean(y_true[topk_idx]))
+def norm_path(p: str) -> str:
+    return str(p).replace("\\", "/") if p else ""
 
 
-def fraud_found_at_k(y_true, y_score, k=1000) -> int:
-    k = min(k, len(y_true))
-    topk_idx = np.argsort(y_score)[-k:]
-    return int(np.sum(y_true[topk_idx]))
+def expected_split_file(root: Path, cfg: dict) -> str:
+    train_on = cfg.get("train_on_split", "baseline")
+    if train_on == "time":
+        p = root / cfg.get("split_time_path", "")
+    else:
+        p = root / cfg.get("split_baseline_path", cfg.get("split_path", ""))
+    return norm_path(str(p.resolve()))
 
 
-def topk_overlap(a, b, k=1000) -> float:
-    k = min(k, len(a))
-    ia = set(np.argsort(a)[-k:])
-    ib = set(np.argsort(b)[-k:])
-    return len(ia & ib) / k
+def get_metric(d: dict, prefix: str, name: str, k: int):
+    """
+    Handles your mixed naming across scripts:
+    - *_precision_at_k vs *_precision_at_1000
+    - *_fraud_found_at_k vs *_fraud_found_at_1000
+    """
+    # direct
+    key = f"{prefix}_{name}"
+    if key in d:
+        return d[key]
+
+    # k variants
+    if name in ("precision_at_k", "fraud_found_at_k"):
+        key1 = f"{prefix}_{name}"                       # e.g. test_precision_at_k
+        key2 = f"{prefix}_{name.replace('_at_k', f'_at_{k}')}"  # e.g. test_precision_at_1000
+        key3 = f"{prefix}_{name.replace('_at_k', '_at_1000')}"  # fallback
+        for kk in (key1, key2, key3):
+            if kk in d:
+                return d[kk]
+
+    return None
 
 
-def compute_metrics(y_true, y_score, k=1000) -> dict:
-    return {
-        "pr_auc": float(average_precision_score(y_true, y_score)),
-        "recall_at_precision_0.10": float(recall_at_fixed_precision(y_true, y_score, 0.10)),
-        "recall_at_precision_0.20": float(recall_at_fixed_precision(y_true, y_score, 0.20)),
-        "precision_at_k": float(precision_at_k(y_true, y_score, k=k)),
-        "fraud_found_at_k": int(fraud_found_at_k(y_true, y_score, k=k)),
-    }
+def load_latest_metrics(root: Path, cfg: dict, wanted_models: list[str], k: int):
+    metrics_dir = root / "results" / "metrics"
+    if not metrics_dir.exists():
+        raise FileNotFoundError(f"Missing metrics dir: {metrics_dir}")
 
+    want_split = expected_split_file(root, cfg)
 
-def measure_latency(model, X, n_rows=50000, n_repeats=3) -> dict:
-    n_rows = min(int(n_rows), len(X))
-    Xs = X.iloc[:n_rows]
+    rows = []
+    for p in sorted(metrics_dir.glob("*.yaml")):
+        data = yaml.safe_load(open(p, "r", encoding="utf-8"))
+        if not isinstance(data, dict):
+            continue
 
-    # warm-up (important for fair timing)
-    _ = model.predict_proba(Xs.iloc[:200])[:, 1]
+        model = data.get("model")
+        if model not in wanted_models:
+            continue
 
-    times = []
-    for _ in range(int(n_repeats)):
-        t0 = time.perf_counter()
-        _ = model.predict_proba(Xs)[:, 1]
-        t1 = time.perf_counter()
-        times.append(t1 - t0)
+        # Filter to the current config’s split file (time vs baseline, dataset-specific)
+        sf = norm_path(str(data.get("split_file", "")))
+        if want_split and sf and sf != want_split:
+            continue
 
-    avg_s = float(np.mean(times))
-    ms_per_row = (avg_s * 1000.0) / n_rows
-    rows_per_s = n_rows / avg_s if avg_s > 0 else float("inf")
-    return {"latency_ms_per_row": float(ms_per_row), "throughput_rows_per_s": float(rows_per_s)}
+        ts = parse_ts(data.get("timestamp")) or datetime.fromtimestamp(p.stat().st_mtime)
 
+        rows.append({
+            "timestamp": ts,
+            "model": model,
+            "split_used": data.get("split_used"),
+            "split_file": data.get("split_file"),
+            "k": data.get("k", k),
+            "target_fpr": data.get("target_fpr"),
+            "op_threshold": data.get("op_threshold"),
+            "op_val_fpr": data.get("op_val_fpr"),
+            "op_val_recall": data.get("op_val_recall"),
 
-def load_latest_models_from_runs(runs_path: Path, wanted_models: list[str], root: Path) -> dict:
-    runs = pd.read_csv(runs_path)
+            "train_pr_auc": data.get("train_pr_auc"),
+            "val_pr_auc": data.get("val_pr_auc"),
+            "test_pr_auc": data.get("test_pr_auc"),
 
-    # parse timestamp (your CSV uses ISO like 2026-02-20T13:10:49)
-    runs["timestamp"] = pd.to_datetime(runs["timestamp"], errors="coerce")
+            "train_recall_at_fpr": data.get("train_recall_at_fpr"),
+            "val_recall_at_fpr": data.get("val_recall_at_fpr"),
+            "test_recall_at_fpr": data.get("test_recall_at_fpr"),
 
-    latest = {}
-    for m in wanted_models:
-        sub = runs[runs["model"] == m].sort_values("timestamp")
-        if sub.empty:
-            raise FileNotFoundError(f"No runs found for model='{m}' in {runs_path}")
-        row = sub.iloc[-1].to_dict()
+            "train_precision@k": get_metric(data, "train", "precision_at_k", k),
+            "val_precision@k": get_metric(data, "val", "precision_at_k", k),
+            "test_precision@k": get_metric(data, "test", "precision_at_k", k),
 
-        model_path = (root / str(row["model_path"])).resolve()
-        metrics_path = (root / str(row["metrics_path"])).resolve()
-        if not model_path.exists():
-            raise FileNotFoundError(f"Model file not found: {model_path}")
-        latest[m] = {"row": row, "model_path": model_path, "metrics_path": metrics_path}
+            "train_fraud_found@k": get_metric(data, "train", "fraud_found_at_k", k),
+            "val_fraud_found@k": get_metric(data, "val", "fraud_found_at_k", k),
+            "test_fraud_found@k": get_metric(data, "test", "fraud_found_at_k", k),
 
-    return latest
+            "test_ms_per_row": data.get("test_ms_per_row"),
+            "test_rows_per_s": data.get("test_rows_per_s"),
+
+            "model_path": data.get("model_path"),
+            "metrics_path": str(p.relative_to(root)),
+        })
+
+    if not rows:
+        raise FileNotFoundError(
+            "No matching metrics YAMLs found for these models + config split. "
+            "Check split_file in your metrics and the config you passed."
+        )
+
+    df = pd.DataFrame(rows)
+
+    # pick latest run per model
+    df = df.sort_values("timestamp").groupby("model", as_index=False).tail(1)
+
+    # nice formatting
+    df["run_timestamp"] = df["timestamp"].dt.strftime("%Y-%m-%d %H:%M:%S")
+    df = df.drop(columns=["timestamp"])
+
+    return df
 
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--config", default="configs/base.yaml")
     ap.add_argument("--k", type=int, default=1000)
-    ap.add_argument("--latency_rows", type=int, default=50000)
-    ap.add_argument("--latency_repeats", type=int, default=3)
-    ap.add_argument("--similarity", action="store_true", help="Print diff/spearman/topK overlap on val")
+    ap.add_argument("--models", default="logreg_balanced,rf_baseline,xgb_baseline",
+                    help="Comma-separated model names as stored in metrics YAML")
+    ap.add_argument("--sort", default="test_pr_auc",
+                    help="Column to sort by (default: test_pr_auc)")
     args = ap.parse_args()
 
     root = project_root()
+    cfg = yaml.safe_load(open(root / args.config, "r", encoding="utf-8"))
+    wanted = [m.strip() for m in args.models.split(",") if m.strip()]
+    k = int(cfg.get("k", args.k))
 
-    cfg = yaml.safe_load(open(root / "configs/base.yaml", "r", encoding="utf-8"))
-    dataset_path = (root / cfg["dataset_path"]).resolve()
-    split_path = (root / cfg.get("split_path", "results/splits/split.npz")).resolve()
-    runs_path = (root / "results/metrics/runs.csv").resolve()
+    df = load_latest_metrics(root, cfg, wanted, k)
 
-    seed = int(cfg.get("random_state", SEED))
+    sort_col = args.sort
+    if sort_col not in df.columns:
+        raise ValueError(f"Unknown sort column '{sort_col}'. Available: {list(df.columns)}")
 
-    df = pd.read_csv(dataset_path)
-    y = df[cfg["target_col"]].astype(int).values
-    X = df.drop(columns=[cfg["target_col"]]).select_dtypes(include=[np.number]).fillna(0)
+    leaderboard = df.sort_values(sort_col, ascending=False)
 
-    train_idx, val_idx, test_idx = get_or_create_split(
-        y=y,
-        seed=seed,
-        split_path=split_path,
-        dataset_path=dataset_path,
-    )
+    # keep the table tight
+    cols = [
+        "model", "run_timestamp", "split_used", "target_fpr",
+        "val_pr_auc", "test_pr_auc",
+        "val_recall_at_fpr", "test_recall_at_fpr",
+        "val_precision@k", "test_precision@k",
+        "val_fraud_found@k", "test_fraud_found@k",
+        "op_threshold", "op_val_fpr", "op_val_recall",
+        "test_ms_per_row", "test_rows_per_s",
+        "model_path", "metrics_path"
+    ]
+    cols = [c for c in cols if c in leaderboard.columns]
 
-    X_val, y_val = X.iloc[val_idx], y[val_idx]
-    X_test, y_test = X.iloc[test_idx], y[test_idx]
-
-    wanted = ["logreg_balanced", "xgb_baseline"]
-    latest = load_latest_models_from_runs(runs_path, wanted, root)
-
-    rows = []
-    preds_val = {}
-
-    for model_name, info in latest.items():
-        model = joblib.load(info["model_path"])
-        p_val = model.predict_proba(X_val)[:, 1]
-        p_test = model.predict_proba(X_test)[:, 1]
-
-        preds_val[model_name] = p_val
-
-        m_val = compute_metrics(y_val, p_val, k=args.k)
-        m_test = compute_metrics(y_test, p_test, k=args.k)
-        lat = measure_latency(model, X_test, n_rows=args.latency_rows, n_repeats=args.latency_repeats)
-
-        rows.append({
-            "model": model_name,
-            "run_timestamp": str(info["row"].get("timestamp")),
-            "val_pr_auc": m_val["pr_auc"],
-            "test_pr_auc": m_test["pr_auc"],
-            f"val_precision@{args.k}": m_val["precision_at_k"],
-            f"val_fraud_found@{args.k}": m_val["fraud_found_at_k"],
-            f"test_precision@{args.k}": m_test["precision_at_k"],
-            f"test_fraud_found@{args.k}": m_test["fraud_found_at_k"],
-            "test_ms_per_row": lat["latency_ms_per_row"],
-            "test_rows_per_s": lat["throughput_rows_per_s"],
-            "model_path": str(info["model_path"].relative_to(root)),
-        })
-
-    leaderboard = pd.DataFrame(rows).sort_values("test_pr_auc", ascending=False)
     pd.set_option("display.max_colwidth", 120)
-    print("\n=== Leaderboard (sorted by test_pr_auc) ===")
-    print(leaderboard.to_string(index=False))
-
-    if args.similarity:
-        a = preds_val["logreg_balanced"]
-        b = preds_val["xgb_baseline"]
-        print("\n=== Similarity checks on VAL ===")
-        print("Max |diff| (val):", float(np.max(np.abs(a - b))))
-        print("Spearman (val):", float(spearmanr(a, b).correlation))
-        print(f"Top{args.k} overlap (val):", float(topk_overlap(a, b, args.k)))
+    print("\n=== Phase 3 Leaderboard (latest run per model) ===")
+    print(f"Config: {args.config}")
+    print(leaderboard[cols].to_string(index=False))
 
 
 if __name__ == "__main__":
