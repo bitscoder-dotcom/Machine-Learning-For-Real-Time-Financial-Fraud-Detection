@@ -1,4 +1,4 @@
-# Phase 1 Summary — Baselines (CreditCard Fraud)
+~~# Phase 1 Summary — Baselines (CreditCard Fraud)
 
 ## Goal
 Build a reproducible baseline pipeline and compare two models fairly using the same fixed 70/15/15 (train/val/test) split.
@@ -35,4 +35,4 @@ logreg_balanced 2026-02-20 13:07:06    0.752139     0.682420               0.068
 ## Reproducibility
 - Each run logs metrics + model paths to: results/metrics/runs.csv
 - Each model artifact is saved under: results/models/
-- Each metrics file is saved under: results/metrics/
+- Each metrics file is saved under: results/metrics/~~
